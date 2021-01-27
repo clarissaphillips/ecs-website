@@ -1,2 +1,2 @@
-# AWS
-Repo for my AWS files (mainly cf templates)
+# ecs-website
+Repo for my cf template and updated files for my AWS hosted websited (scaled down Jan 2021)
