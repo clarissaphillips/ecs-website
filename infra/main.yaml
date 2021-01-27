@@ -1,0 +1,228 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: A sample template
+Parameters: 
+  VPCCidr:
+    Description: The IP address range used for the main VPC.
+    Type: String
+    MinLength: '9'
+    MaxLength: '18'
+    AllowedPattern: "(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2})"
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
+
+  ClusterName:
+    Description: The name for the ECS Cluster
+    Type: String
+    Default: "website-cluster"
+
+  # DockerImageID:
+  #   Description: The ImageId for the Docker image I want to run in my EC2.
+  #   Type: String
+  #   Default: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AWS::StackName}:latest
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VPCCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: false
+      
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  RouteTableAssoc1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  RouteTableAssoc2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  Route:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+      RouteTableId: !Ref RouteTable
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      CidrBlock: !Select [ 0, !Cidr [ !Ref VPCCidr, 2, 4 ]]
+      MapPublicIpOnLaunch: true
+      
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 1, !GetAZs  '' ]
+      CidrBlock: !Select [ 1, !Cidr [ !Ref VPCCidr, 2, 4 ]]
+      MapPublicIpOnLaunch: true
+          
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Allow all access in and out"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref ClusterName
+  
+  TaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+        - Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AWS::StackName}:latest
+          Name: "website"
+          Memory: 128  
+          PortMappings:
+            - ContainerPort: 80
+              HostPort: 80
+
+  ECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref ECSCluster
+      DesiredCount: 1
+      TaskDefinition: !Ref TaskDef
+      LaunchType: "EC2"
+
+  PublicLoadBalancerSG:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: Access to the public facing load balancer
+        VpcId: !Ref 'VPC'
+        SecurityGroupIngress:
+            # Allow access to ALB from anywhere on the internet
+            - CidrIp: 0.0.0.0/0
+              IpProtocol: -1
+
+  PublicLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      LoadBalancerAttributes:
+      - Key: idle_timeout.timeout_seconds
+        Value: '30'
+      Subnets:
+        # The load balancer is placed into the public subnets, so that traffic
+        # from the internet can reach the load balancer directly via the internet gateway
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups: [!Ref 'PublicLoadBalancerSG']
+
+  NonSpotLaunchConfig: 
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties: 
+      KeyName: ClarissaKey
+      ImageId: ami-0ae254c8a2d3346a7
+      SecurityGroups:
+        - !Ref SecurityGroup
+      InstanceType: t2.micro
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          echo ECS_CLUSTER=${ClusterName} >> /etc/ecs/ecs.config
+      InstanceMonitoring: false
+      IamInstanceProfile: ecsInstanceRole
+      BlockDeviceMappings: 
+        - DeviceName: /dev/xvda
+          Ebs: 
+            VolumeSize: 30
+            VolumeType: 'gp2'
+
+  TargetGroupPublic:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 6
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Name: !Join ['-', [!Ref 'AWS::StackName', 'drop-1']]
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 2
+      VpcId: !Ref 'VPC'
+
+  NonSpotAutoScalingA:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties: 
+      AutoScalingGroupName: website-scale
+      AvailabilityZones: 
+        - !Select 
+          - 0
+          - Fn::GetAZs: !Ref 'AWS::Region'
+      Cooldown: '300'
+      DesiredCapacity: '1'
+      HealthCheckGracePeriod: 300
+      HealthCheckType: EC2
+      LaunchConfigurationName: !Ref NonSpotLaunchConfig
+      MaxSize: '1'
+      MinSize: '0'
+      MetricsCollection:
+        - 
+          Granularity: "1Minute"
+          Metrics: 
+            - 'GroupInServiceInstances'
+      ServiceLinkedRoleARN: !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling
+      TargetGroupARNs:
+        - !Ref TargetGroupPublic
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet1
+      Tags:
+        - Key: Env
+          Value: prod
+          PropagateAtLaunch: true
+
+  HTTPListener:
+    Type: "AWS::ElasticLoadBalancingV2::Listener"
+    Properties:
+      LoadBalancerArn: !Ref PublicLoadBalancer
+      Port: 80
+      Protocol: "HTTP"
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroupPublic
+
+  # EC2:
+  #   Type: AWS::EC2::Instance
+  #   Properties:
+  #     InstanceType: t2.micro
+  #     ImageId: ami-0ae254c8a2d3346a7
+  #     SubnetId: !Ref PublicSubnet1
+  #     KeyName: ClarissaKey
+  #     UserData: 
+  #       Fn::Base64: !Sub |
+  #         #!/bin/bash
+  #         echo ECS_CLUSTER=${ClusterName} >> /etc/ecs/ecs.config
+  #     SecurityGroupIds: [ !Ref SecurityGroup ]
+  #     IamInstanceProfile: ecsInstanceRole

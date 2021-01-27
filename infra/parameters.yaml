@@ -1,0 +1,2 @@
+- ParameterKey: VPCCidr
+  ParameterValue: "${VPCCidr}"
